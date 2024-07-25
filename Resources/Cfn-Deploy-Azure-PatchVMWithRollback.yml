@@ -1,0 +1,564 @@
+---
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This AWS CloudFormation template creates a AWS Systems Manager
+  Automation runbook, AWS Lambda function and related resources for performing
+  patching with failback on an Azure VM instance registered as an SSM hybrid
+  node.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Parameters:
+          - LambdaLayerS3Bucket
+          - LambdaLayerS3Key
+          - ClientID
+          - TenantID
+          - ClientSecret
+Parameters:
+  LambdaLayerS3Bucket:
+    Description: Name of the Amazon S3 bucket containing the custom AWS Lambda layer package
+    Type: String
+  LambdaLayerS3Key:
+    Type: String
+    Description: Filename (Amazon S3 Key) of the custom AWS Lambda layer package
+    Default: python3-azure-modules.zip
+  ClientID:
+    Type: String
+    Description: (Required) Enter the secure string SSM Parameter name where you
+      stored the Azure ClientID
+    Default: client_id
+  TenantID:
+    Type: String
+    Description: (Required) Enter the secure string SSM Parameter name where you
+      stored the Azure TenantID
+    Default: tenant_id
+  ClientSecret:
+    Type: String
+    Description: (Required) Enter the secure string SSM Parameter name where you
+      stored the Azure ClientSecret
+    Default: client_secret
+Resources:
+  AWSSystemsManagerAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: AllowLambdaInvocation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt AzureManagedDiskSnapshots.Arn
+                Effect: Allow
+      Tags:
+        - Key: CloudFormationStackId
+          Value: !Ref AWS::StackId
+        - Key: CloudFormationStackName
+          Value: !Ref AWS::StackName
+  AWSSystemsManagerAutomationRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: '0.3'
+        description: Brings Azure VM Instance into compliance with standing Baseline;
+          rolls back root Volume on failure.
+        assumeRole: '{{AutomationAssumeRole}}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: (Optional) The ARN of the role that allows Automation to perform
+              the actions on your behalf.
+            default: !GetAtt AWSSystemsManagerAutomationRole.Arn
+          InstanceId:
+            type: String
+            description: Enter the hybrid node ID
+          clientid:
+            type: String
+            description: (Required) Enter the secure string SSM Parameter Name where you
+              stored Azure ClientID
+            default: !Ref ClientID
+          tenantid:
+            type: String
+            description: (Required)  Enter the secure string SSM Parameter Name where you
+              stored Azure TenantID
+            default: !Ref TenantID
+          clientsecret:
+            type: String
+            description: (Required)  Enter the secure string SSM Parameter Name where you
+              stored Azure ClientSecret
+            default: !Ref ClientSecret
+          SleepDuration:
+            type: String
+            description: (Required) Enter the sleep duration in ISO 8601 format to assert
+              the snapshot creation status. Default is 30s. Example - For to
+              sleep for 5 minutes, enter 'PT5M'
+            default: PT30S
+        mainSteps:
+          - name: GetAzureNodePlatformDetails
+            action: aws:executeAwsApi
+            nextStep: ChooseOSforCommands
+            isEnd: false
+            inputs:
+              Service: ssm
+              Api: DescribeInstanceInformation
+              Filters:
+                - Key: InstanceIds
+                  Values:
+                    - '{{ InstanceId }}'
+            outputs:
+              - Name: platform
+                Selector: $.InstanceInformationList[0].PlatformType
+                Type: String
+          - name: ChooseOSforCommands
+            action: aws:branch
+            inputs:
+              Choices:
+                - NextStep: ExtractVMDetailsfromWindows
+                  Variable: '{{GetAzureNodePlatformDetails.platform}}'
+                  StringEquals: Windows
+                - NextStep: ExtractVMDetailsfromLinux
+                  Variable: '{{GetAzureNodePlatformDetails.platform}}'
+                  StringEquals: Linux
+              Default: ExtractVMDetailsfromLinux
+          - name: ExtractVMDetailsfromLinux
+            action: aws:runCommand
+            nextStep: ConvertStringtoJSON
+            isEnd: false
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - '{{InstanceId}}'
+              Parameters:
+                commands:
+                  - '#!/bin/bash'
+                  - '# Get VM metadata...'
+                  - metadata=$(curl -sL -H "metadata:true"
+                    "http://169.254.169.254/metadata/instance?api-version=2020-09-01")
+                  - '# Extract desired fields using python'
+                  - name=$(echo "$metadata" | python3 -c 'import json, sys; data
+                    = json.load(sys.stdin); print(data["compute"]["name"])')
+                  - osDiskname=$(echo "$metadata" | python3 -c 'import json,
+                    sys; data = json.load(sys.stdin);
+                    print(data["compute"]["storageProfile"]["osDisk"]["name"])')
+                  - resourceGroup=$(echo "$metadata" | python3 -c 'import json,
+                    sys; data = json.load(sys.stdin);
+                    print(data["compute"]["resourceGroupName"])')
+                  - subscriptionId=$(echo "$metadata" | python3 -c 'import json,
+                    sys; data = json.load(sys.stdin);
+                    print(data["compute"]["subscriptionId"])')
+                  - '# Create JSON object and print'
+                  - |
+                    data="{ \"name\": \"$name\",\"osDiskname\": \"$osDiskname\", \"resourceGroupName\": \"$resourceGroup\", \"subscriptionId\": \"$subscriptionId\" }"
+                  - echo $data
+            outputs:
+              - Name: VMproperties
+                Selector: $.Output
+                Type: String
+          - name: ExtractVMDetailsfromWindows
+            action: aws:runCommand
+            nextStep: ConvertStringtoJSON
+            isEnd: false
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunPowerShellScript
+              InstanceIds:
+                - '{{InstanceId}}'
+              Parameters:
+                commands:
+                  - '# Retrieve VM metadata'
+                  - $vmInfo = Invoke-RestMethod -Headers @{'Metadata'='true'}
+                    -Method GET -Uri
+                    'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
+                    | ConvertTo-Json -Depth 64
+                  - ''
+                  - '# Convert JSON to PSObject'
+                  - $obj = $vmInfo | ConvertFrom-Json
+                  - ''
+                  - '#Extract variables'
+                  - $output = [PSCustomObject]@{
+                  - ' name = $obj.compute.name'
+                  - ' osDiskname = $obj.compute.storageProfile.osDisk.name'
+                  - ' resourceGroupName = $obj.compute.resourceGroupName'
+                  - ' subscriptionId = $obj.compute.subscriptionId'
+                  - '}'
+                  - ''
+                  - $output | ConvertTo-Json
+            outputs:
+              - Name: VMproperties
+                Selector: $.Output
+                Type: String
+          - name: ConvertStringtoJSON
+            action: aws:executeScript
+            nextStep: CreateSnapshot
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: event_handler
+              InputPayload:
+                LinuxNodeDetails: '{{ ExtractVMDetailsfromLinux.VMproperties }}'
+                WindowsNodeDetails: '{{ ExtractVMDetailsfromWindows.VMproperties }}'
+                platformtype: '{{ GetAzureNodePlatformDetails.platform }}'
+              Script: |-
+                def event_handler(events,context):
+                    import json
+                    import boto3
+                    # Given string
+                    input_string1 = events['LinuxNodeDetails']
+                    input_string2 = events['WindowsNodeDetails']
+                    platform = events['platformtype']
+                    # Convert string to JSON
+                    if platform == 'Windows':
+                      json_data = json.loads(input_string2)
+                    else:
+                      json_data = json.loads(input_string1)
+                    # Extract all fields
+                    name = json_data.get("name")
+                    osDiskname = json_data.get("osDiskname")
+                    rg = json_data.get("resourceGroupName")
+                    sub = json_data.get("subscriptionId")
+                    # Return in JSON format
+                    return {
+                        "VMName" : name,
+                        "VMOSDiskName" : osDiskname,
+                        "ResourceGroupName" : rg,
+                        "SubscriptionID" : sub
+                    }
+            outputs:
+              - Name: AzureVMName
+                Selector: $.Payload.VMName
+                Type: String
+              - Name: VMOSDiskName
+                Selector: $.Payload.VMOSDiskName
+                Type: String
+              - Name: AzureResourceGroupName
+                Selector: $.Payload.ResourceGroupName
+                Type: String
+              - Name: AzureSubscriptionID
+                Selector: $.Payload.SubscriptionID
+                Type: String
+          - name: CreateSnapshot
+            action: aws:invokeLambdaFunction
+            nextStep: AssertSnapshotProvisionStatus
+            isEnd: false
+            onFailure: Abort
+            inputs:
+              FunctionName: !Ref AzureManagedDiskSnapshots
+              InputPayload:
+                client_id: '{{ clientid }}'
+                tenant_id: '{{ tenantid }}'
+                client_secret: '{{ clientsecret }}'
+                sub_id: '{{ ConvertStringtoJSON.AzureSubscriptionID }}'
+                vm_name: '{{ ConvertStringtoJSON.AzureVMName }}'
+                rg_name: '{{ ConvertStringtoJSON.AzureResourceGroupName }}'
+                os_disk: '{{ ConvertStringtoJSON.VMOSDiskName }}'
+                step_name: CreateSnapshot
+            outputs:
+              - Name: SnapshotName
+                Selector: $.SnapshotName
+                Type: String
+          - name: AssertSnapshotProvisionStatus
+            action: aws:loop
+            nextStep: InstallPatches
+            isEnd: false
+            onFailure: Abort
+            inputs:
+              MaxIterations: 3
+              LoopCondition:
+                Variable: '{{ CheckSnapshotStatus.SnapshotStatus }}'
+                StringEquals: Pending
+              Steps:
+                - name: Sleep
+                  action: aws:sleep
+                  nextStep: CheckSnapshotStatus
+                  isEnd: false
+                  inputs:
+                    Duration: '{{ SleepDuration }}'
+                - name: CheckSnapshotStatus
+                  action: aws:invokeLambdaFunction
+                  isEnd: true
+                  inputs:
+                    FunctionName: !Ref AzureManagedDiskSnapshots
+                    InputPayload:
+                      client_id: '{{ clientid }}'
+                      tenant_id: '{{ tenantid }}'
+                      client_secret: '{{ clientsecret }}'
+                      sub_id: '{{ ConvertStringtoJSON.AzureSubscriptionID }}'
+                      vm_name: '{{ ConvertStringtoJSON.AzureVMName }}'
+                      rg_name: '{{ ConvertStringtoJSON.AzureResourceGroupName }}'
+                      os_disk: '{{ ConvertStringtoJSON.VMOSDiskName }}'
+                      step_name: CheckSnapshotStatus
+                  outputs:
+                    - Name: SnapshotStatus
+                      Selector: $.SnapshotStatus
+                      Type: String
+          - name: InstallPatches
+            action: aws:runCommand
+            maxAttempts: 1
+            nextStep: DeleteSnapshot
+            isEnd: false
+            onFailure: step:RestoreVMDisk
+            inputs:
+              DocumentName: AWS-RunPatchBaseline
+              InstanceIds:
+                - '{{InstanceId}}'
+              Parameters:
+                Operation: Install
+            outputs:
+              - Name: PatchOutputStatus
+                Selector: $.Status
+                Type: String
+              - Name: PatchCommandId
+                Selector: $.CommandId
+                Type: String
+          - name: RestoreVMDisk
+            action: aws:invokeLambdaFunction
+            nextStep: DeleteSnapshot
+            onFailure: Abort
+            inputs:
+              FunctionName: !Ref AzureManagedDiskSnapshots
+              InputPayload:
+                client_id: '{{ clientid }}'
+                tenant_id: '{{ tenantid }}'
+                client_secret: '{{ clientsecret }}'
+                sub_id: '{{ ConvertStringtoJSON.AzureSubscriptionID }}'
+                vm_name: '{{ ConvertStringtoJSON.AzureVMName }}'
+                rg_name: '{{ ConvertStringtoJSON.AzureResourceGroupName }}'
+                os_disk: '{{ ConvertStringtoJSON.VMOSDiskName }}'
+                step_name: RestoreVM
+          - name: DeleteSnapshot
+            action: aws:invokeLambdaFunction
+            isEnd: true
+            inputs:
+              FunctionName: !Ref AzureManagedDiskSnapshots
+              InputPayload:
+                client_id: '{{ clientid }}'
+                tenant_id: '{{ tenantid }}'
+                client_secret: '{{ clientsecret }}'
+                sub_id: '{{ ConvertStringtoJSON.AzureSubscriptionID }}'
+                vm_name: '{{ ConvertStringtoJSON.AzureVMName }}'
+                rg_name: '{{ ConvertStringtoJSON.AzureResourceGroupName }}'
+                os_disk: '{{ ConvertStringtoJSON.VMOSDiskName }}'
+                step_name: DeleteSnapshot
+  AzureLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+  AWSLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaPolicy-AzureManagedDiskSnapshots
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource: !GetAtt AzureLambdaLogGroup.Arn
+                Effect: Allow
+              - Action: ssm:GetParameter
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ClientID}
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${TenantID}
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ClientSecret}
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: AWSLambdaRole
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName
+  CustomLambdaLayerforAzureModules:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      Description: Lambda Layer for Azure Resource Manager (ARM) Python Modules
+      Content:
+        S3Bucket: !Ref LambdaLayerS3Bucket
+        S3Key: !Ref LambdaLayerS3Key
+      CompatibleRuntimes:
+        - python3.12
+  AzureManagedDiskSnapshots:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: !Sub 'Lambda function to perform platform level changes in Azure
+        environment. CloudFormation stack name: ${AWS::StackName}'
+      Code:
+        ZipFile: |
+          # Import required python modules
+          import boto3
+          import logging
+          from datetime import datetime, date
+          from azure.identity import ClientSecretCredential
+          from azure.mgmt.compute import ComputeManagementClient
+          # Main Lambda Function handler that calls all sub functions
+          def lambda_handler(event, context):
+              # Declare Global variables
+              global sub_id, rg_name, vm_name, os_disk, snapshot_name, new_osdisk, credentials, compute_client
+              # Fetch current date
+              today = date.today()
+              # Extract VM properties from previous step
+              sub_id = event['sub_id']
+              rg_name = event['rg_name']
+              vm_name = event['vm_name']
+              os_disk = event['os_disk']
+              step_name = event['step_name']
+              # Assign names for new snapshot and new OSdisk
+              snapshot_name = f"{vm_name}-{today}"
+              new_osdisk =  f"{vm_name}-restored-{today}"
+              # Create a SDK clients for SSM Boto3
+              ssm = boto3.client('ssm')
+              # Create a ClientSecretCredential
+              credentials = ClientSecretCredential(
+                  client_id = ssm.get_parameter(Name=event['client_id'], WithDecryption=True)['Parameter']['Value'],
+                  tenant_id = ssm.get_parameter(Name=event['tenant_id'], WithDecryption=True)['Parameter']['Value'],
+                  client_secret = ssm.get_parameter(Name=event['client_secret'], WithDecryption=True)['Parameter']['Value']
+                  )
+              # SDK client for Azure Compute
+              compute_client = ComputeManagementClient(credentials, sub_id)
+              # Branch the function based on step input
+              steps = {
+                  "CreateSnapshot": create_snapshot,
+                  "CheckSnapshotStatus": check_snapshot_status,
+                  "RestoreVM": restore_vm,
+                  "DeleteSnapshot": delete_snapshot
+              }
+              output = steps[step_name]()
+              return output
+          # Function to create a snapshot of the VM OS disk
+          def create_snapshot():
+              # SDK ref - https://learn.microsoft.com/en-us/azure/developer/python/sdk/examples/azure-sdk-samples-managed-disks
+              try:
+                  managed_disk = compute_client.disks.get(rg_name, os_disk)
+                  # Creates a snapshot of the specified VM disk.
+                  snapshot = compute_client.snapshots.begin_create_or_update(
+                      rg_name, snapshot_name,
+                      {
+                          "location": compute_client.virtual_machines.get(rg_name, vm_name).location,
+                          "creation_data": {
+                              "create_option": "Copy",
+                              "source_uri": managed_disk.id
+                          }
+                      }
+                  ).result()
+                  # return only the snapshot name
+                  return {
+                      "SnapshotName" : snapshot.name
+                  }
+              except Exception as err:
+                  logging.error(f"Unexpected {err=}, {type(err)=}")
+                  raise
+          # Function to check the status of the snapshot created earlier
+          def check_snapshot_status():
+              try:
+                  # Get the snapshot object
+                  snapshot = compute_client.snapshots.get(rg_name, snapshot_name)
+                  # Check if the snapshot is ready
+                  if snapshot.provisioning_state == "Succeeded":
+                      return {
+                          "SnapshotStatus": "Success"
+                      }
+                  else:
+                      return {
+                          "SnapshotStatus": "Pending"
+                      }
+              except Exception as err:
+                  logging.error(f"Unexpected {err=}, {type(err)=}")
+                  raise
+          # Function to cleanup the snapshot created earlier upon successful patching operation
+          def delete_snapshot():
+              # Delete the snapshot
+              try:
+                  compute_client.snapshots.begin_delete(rg_name, snapshot_name)
+                  return f"Snapshot {snapshot_name} was deleted"
+              except Exception as err:
+                  logging.error(f"Unexpected {err=}, {type(err)=}")
+                  raise
+          # Function to restore the VM OS disk from the snapshot created earlier upon failed patching operation
+          def restore_vm():
+              try:
+                  # Get Snapshot details
+                  snapshot = compute_client.snapshots.get(rg_name,snapshot_name)
+                  # Create a new managed disk from the snapshot
+                  new_disk = compute_client.disks.begin_create_or_update(
+                      rg_name, new_osdisk,
+                      {
+                          "location": compute_client.virtual_machines.get(rg_name, vm_name).location,
+                          "zones": compute_client.virtual_machines.get(rg_name, vm_name).zones,
+                          "creation_data": {
+                              "create_option": "Copy",
+                              "source_resource_id": snapshot.id
+                          }
+                      }
+                  ).result()
+                  # Get the VM object
+                  vm = compute_client.virtual_machines.get(rg_name, vm_name)
+                  # Reference -https://learn.microsoft.com/en-us/python/api/azure-mgmt-compute/azure.mgmt.compute.v2023_09_01.operations.virtualmachinesoperations?view=azure-python#azure-mgmt-compute-v2023-09-01-operations-virtualmachinesoperations-begin-create-or-update
+                  # PowerOff the VM
+                  vm_stop = compute_client.virtual_machines.begin_power_off(rg_name, vm_name)
+                  vm_stop.wait()
+                  # Swap and attach the new OS disk to the VM
+                  vm.storage_profile.os_disk.managed_disk.id = new_disk.id
+                  vm.storage_profile.os_disk.name = new_osdisk
+                  # Update the VM with the new OS disk
+                  compute_client.virtual_machines.begin_create_or_update(rg_name, vm_name, vm)
+                  # Start the VM again
+                  compute_client.virtual_machines.begin_start(rg_name, vm_name)
+                  return f"Disk Restore for VM {vm_name} was successful"
+              except Exception as err:
+                  logging.error(f"Unexpected {err=}, {type(err)=}")
+                  raise
+
+      Handler: index.lambda_handler
+      Role: !GetAtt AWSLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 900
+      LoggingConfig:
+        LogGroup: !Ref AzureLambdaLogGroup
+      Layers:
+        - !Ref CustomLambdaLayerforAzureModules
+Outputs:
+  AzureLambdaFunctionName:
+    Description: AzureManagedDiskSnapshots Lambda Function
+    Value: !Ref AzureManagedDiskSnapshots
+  AWSSystemsManagerAutomationRunbookName:
+    Description: Azure-PatchVMWithRollback Automation Runbook
+    Value: !Ref AWSSystemsManagerAutomationRunbook
