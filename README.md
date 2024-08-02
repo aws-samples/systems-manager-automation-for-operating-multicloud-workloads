@@ -66,7 +66,7 @@ Setup Instructions are divided into two sections:
 2. Preparing and uploading the Azure python module package to [Amazon S3](https://aws.amazon.com/s3/). This S3 bucket will be passed as input to CFN template in the next step to prepare custom lambda layer.
 3. Deploying the [Cloudformation](./Resources/Cfn-Deploy-Azure-PatchVMWithRollback.yml) template to provision **Azure-PatchVMWithRollback** runbook and **AzureManagedDiskSnapshots** Lambda Function.
 
-For the detailed instructions of deploying above steps, please follow the [Solution Deployment]() section of the blog.
+For the detailed instructions of deploying above steps, please follow the [Solution Deployment](https://aws.amazon.com/blogs/mt/automate-your-multicloud-operations-with-aws-systems-manager-and-aws-lambda/#Solution_Deployment) section of the blog.
 
 ## Security
 
